@@ -3,7 +3,7 @@ import type { PropertyRow } from "@/lib/properties";
 
 const PAGE_SIZE = 1000;
 const SELECT_COLUMNS =
-  "id, cadastre_number, street_name, house_number, area_sqm, geom, client_name, phone, email, mowing_price, is_archived, last_edited_at, status, services";
+  "id, cadastre_number, street_name, house_number, area_sqm, geom, client_id, mowing_price, is_archived, last_edited_at, status, services";
 
 /**
  * PostgREST (Supabase) caps each response at 1000 rows by default.

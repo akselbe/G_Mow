@@ -22,9 +22,7 @@ export type PropertyRow = {
   house_number: string | null;
   area_sqm: number | null;
   geom: unknown;
-  client_name: string | null;
-  phone: string | null;
-  email: string | null;
+  client_id: string | null;
   mowing_price: number | null;
   is_archived: boolean;
   last_edited_at: string | null;
@@ -33,6 +31,13 @@ export type PropertyRow = {
 };
 
 export type PropertyDetails = Omit<PropertyRow, "geom">;
+
+export type ProfileRow = {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  phone_number: string | null;
+};
 
 export function formatAddress(
   street_name: string | null | undefined,
@@ -134,9 +139,7 @@ export function rowsToFeatureCollection(
         street_name: row.street_name,
         house_number: row.house_number,
         area_sqm: row.area_sqm,
-        client_name: row.client_name,
-        phone: row.phone,
-        email: row.email,
+        client_id: row.client_id,
         mowing_price: row.mowing_price,
         is_archived: row.is_archived,
         last_edited_at: row.last_edited_at,
@@ -161,21 +164,37 @@ export function calculateMowingPrice(
   includesTrimming: boolean = true,
   includesBorders: boolean = true
 ): number {
-  // Base rate for just mowing the main lawn (approx €0.04/sqm)
-  const BASE_RATE_PER_SQM = 0.03;
-  
-  let price = areaSqm * BASE_RATE_PER_SQM;
+  if (areaSqm <= 0) return 0;
 
-  // Add-on: Trimming scales with the size of the property
+  // €10 base price
+  const basePrice = 10;
+
+  // 80% effective area (since gardens/drives/etc. are not mowable)
+  const effectiveArea = areaSqm * 0.8;
+
+  // We use a square-root scaling model to level out the cost per m2.
+  // This achieves the target prices of €40 for 700 sqm and €60 for 2000 sqm
+  // when all services (mowing, trimming, outside) are selected.
+  const servicesBaseFactor = Math.sqrt(effectiveArea);
+
+  // Mowing represents 80% of the service base rate
+  const mowingPrice = servicesBaseFactor * 0.912; // 1.14 * 0.8
+
+  let servicesPrice = mowingPrice;
+
+  // Trimming represents 20% of the service base rate
   if (includesTrimming) {
-    price += areaSqm * 0.005;
+    const trimmingPrice = servicesBaseFactor * 0.228; // 1.14 * 0.2
+    servicesPrice += trimmingPrice;
   }
 
-  // Add-on: Outside/Inside borders is a flat complexity fee
+  // If outside ditch/street borders is selected, combined service price is multiplied by 1.1
   if (includesBorders) {
-    price += 6.00;
+    servicesPrice *= 1.1;
   }
+
+  const finalPrice = basePrice + servicesPrice;
 
   // Round to the nearest whole Euro for clean CRM billing
-  return Math.round(price);
+  return Math.round(finalPrice);
 }

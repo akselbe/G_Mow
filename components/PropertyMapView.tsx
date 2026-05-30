@@ -7,24 +7,33 @@ import maplibregl, {
   type Map,
 } from "maplibre-gl";
 
-import { fetchAllProperties } from "@/lib/fetchAllProperties";
 import {
   clonePropertyRows,
-  syncPropertiesToSnapshot,
 } from "@/lib/syncPropertiesUndo";
-import { supabase } from "@/lib/supabase";
 import {
   PROPERTY_STATUSES,
   STATUS_MAP_COLORS,
   calculateMowingPrice,
   formatAddress,
   formatLastEdited,
+  parseGeometry,
   rowsToFeatureCollection,
   statusColorMatchExpression,
   type GeoJsonFeatureCollection,
   type PropertyDetails,
   type PropertyRow,
+  type ProfileRow,
+  type PropertyStatus,
 } from "@/lib/properties";
+import {
+  fetchAllPropertiesAction,
+  fetchAllProfilesAction,
+  updatePropertyAction,
+  deletePropertyAction,
+  bulkStatusUpdateAction,
+  bulkDeleteAction,
+  syncPropertiesToSnapshotAction,
+} from "@/app/actions/properties";
 
 const GARUPE_CENTER: [number, number] = [24.24, 57.12];
 const INITIAL_ZOOM = 14.5;
@@ -39,9 +48,7 @@ const emptyDetails = (): PropertyDetails => ({
   street_name: null,
   house_number: null,
   area_sqm: null,
-  client_name: null,
-  phone: null,
-  email: null,
+  client_id: null,
   mowing_price: null,
   is_archived: false,
   last_edited_at: null,
@@ -79,13 +86,11 @@ function detailsFromFeatureProps(
     street_name: parseOptionalString(props.street_name),
     house_number: parseOptionalString(props.house_number),
     area_sqm: parseOptionalNumber(props.area_sqm),
-    client_name: parseOptionalString(props.client_name),
-    phone: parseOptionalString(props.phone),
-    email: parseOptionalString(props.email),
+    client_id: parseOptionalString(props.client_id),
     mowing_price: parseOptionalNumber(props.mowing_price),
     is_archived: props.is_archived === true,
     last_edited_at: parseOptionalString(props.last_edited_at),
-    status: parseOptionalString(props.status),
+    status: parseOptionalString(props.status)?.toLowerCase() || null,
     services: parsedServices,
   };
 }
@@ -133,12 +138,16 @@ export default function PropertyMapView() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [selected, setSelected] = useState<PropertyDetails | null>(null);
   const [draft, setDraft] = useState<PropertyDetails>(emptyDetails());
+  const servicesInputRef = useRef<HTMLInputElement>(null);
+  const [servicesInputValue, setServicesInputValue] = useState("");
+  const [profiles, setProfiles] = useState<ProfileRow[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchExpanded, setSearchExpanded] = useState(false);
 
   const [bulkStatus, setBulkStatus] = useState<string>("active");
   const [bulkSaving, setBulkSaving] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [bulkError, setBulkError] = useState<string | null>(null);
-  const [infoPaneOpen, setInfoPaneOpen] = useState(false);
   const [undoSnapshot, setUndoSnapshot] = useState<UndoSnapshot | null>(null);
   const [undoing, setUndoing] = useState(false);
   const [undoError, setUndoError] = useState<string | null>(null);
@@ -203,8 +212,7 @@ export default function PropertyMapView() {
     setUndoing(true);
     setUndoError(null);
 
-    const { error } = await syncPropertiesToSnapshot(
-      supabase,
+    const { error } = await syncPropertiesToSnapshotAction(
       undoSnapshot.properties,
       properties
     );
@@ -289,19 +297,72 @@ export default function PropertyMapView() {
     setLoading(true);
     setFetchError(null);
 
-    const { rows, error } = await fetchAllProperties();
+    const [propertiesRes, profilesRes] = await Promise.all([
+      fetchAllPropertiesAction(),
+      fetchAllProfilesAction(),
+    ]);
 
-    if (error) {
-      setFetchError(error);
+    if (propertiesRes.error) {
+      setFetchError(propertiesRes.error);
       setLoading(false);
       return;
     }
 
-    setProperties(rows);
-    syncMapData(rowsToFeatureCollection(rows));
+    if (profilesRes.error) {
+      setFetchError(profilesRes.error);
+      setLoading(false);
+      return;
+    }
+
+    // Normalize property statuses to lowercase to ensure map color matching and select options matching
+    const normalizedRows = propertiesRes.rows.map((row) => ({
+      ...row,
+      status: row.status ? row.status.toLowerCase() : null,
+    }));
+
+    setProfiles(profilesRes.profiles);
+    setProperties(normalizedRows);
+    syncMapData(rowsToFeatureCollection(normalizedRows));
     setUndoSnapshot(null);
     setLoading(false);
   }, [syncMapData]);
+
+  const zoomToProperty = useCallback((property: PropertyRow) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const geom = parseGeometry(property.geom);
+    if (!geom) return;
+
+    let center: [number, number] | null = null;
+    if (geom.type === "Polygon") {
+      const coords = (geom.coordinates as any)[0];
+      if (coords && coords.length > 0) {
+        let sumX = 0, sumY = 0;
+        coords.forEach(([x, y]: any) => { sumX += x; sumY += y; });
+        center = [sumX / coords.length, sumY / coords.length];
+      }
+    } else if (geom.type === "MultiPolygon") {
+      const coords = (geom.coordinates as any)[0][0];
+      if (coords && coords.length > 0) {
+        let sumX = 0, sumY = 0;
+        coords.forEach(([x, y]: any) => { sumX += x; sumY += y; });
+        center = [sumX / coords.length, sumY / coords.length];
+      }
+    } else if (geom.type === "Point") {
+      center = geom.coordinates as [number, number];
+    }
+
+    if (center) {
+      map.flyTo({
+        center,
+        zoom: 17,
+        essential: true,
+      });
+
+      updateSelection([property.id], detailsFromRow(property));
+      setPanelOpen(true);
+    }
+  }, [updateSelection]);
 
   useEffect(() => {
     loadProperties();
@@ -488,9 +549,7 @@ export default function PropertyMapView() {
     setSaveError(null);
 
     const payload = {
-      client_name: draft.client_name?.trim() || null,
-      phone: draft.phone?.trim() || null,
-      email: draft.email?.trim() || null,
+      client_id: draft.client_id || null,
       mowing_price:
         draft.mowing_price === null || draft.mowing_price === undefined
           ? null
@@ -500,13 +559,10 @@ export default function PropertyMapView() {
       last_edited_at: new Date().toISOString(),
     };
 
-    const { error } = await supabase
-      .from("properties")
-      .update(payload)
-      .eq("id", selected.id);
+    const { error } = await updatePropertyAction(selected.id, payload);
 
     if (error) {
-      setSaveError(error.message);
+      setSaveError(error);
       setSaving(false);
       return;
     }
@@ -538,13 +594,10 @@ export default function PropertyMapView() {
     setDeleting(true);
     setSaveError(null);
 
-    const { error } = await supabase
-      .from("properties")
-      .delete()
-      .eq("id", selected.id);
+    const { error } = await deletePropertyAction(selected.id);
 
     if (error) {
-      setSaveError(error.message);
+      setSaveError(error);
       setDeleting(false);
       return;
     }
@@ -564,14 +617,11 @@ export default function PropertyMapView() {
     setBulkSaving(true);
     setBulkError(null);
 
-    const status = bulkStatus.trim() || null;
-    const { error } = await supabase
-      .from("properties")
-      .update({ status })
-      .in("id", selectedIds);
+    const status = bulkStatus.trim() || "new";
+    const { error } = await bulkStatusUpdateAction(selectedIds, status);
 
     if (error) {
-      setBulkError(error.message);
+      setBulkError(error);
       setBulkSaving(false);
       return;
     }
@@ -593,13 +643,10 @@ export default function PropertyMapView() {
     setBulkDeleting(true);
     setBulkError(null);
 
-    const { error } = await supabase
-      .from("properties")
-      .delete()
-      .in("id", selectedIds);
+    const { error } = await bulkDeleteAction(selectedIds);
 
     if (error) {
-      setBulkError(error.message);
+      setBulkError(error);
       setBulkDeleting(false);
       return;
     }
@@ -626,9 +673,7 @@ export default function PropertyMapView() {
   const bulkBusy = bulkSaving || bulkDeleting;
 
   const isDirty = selected ? (
-    draft.client_name !== selected.client_name ||
-    draft.phone !== selected.phone ||
-    draft.email !== selected.email ||
+    draft.client_id !== selected.client_id ||
     draft.mowing_price !== selected.mowing_price ||
     draft.status !== selected.status ||
     JSON.stringify(draft.services || []) !== JSON.stringify(selected.services || [])
@@ -671,89 +716,199 @@ export default function PropertyMapView() {
         </div>
       )}
 
-      <div className="absolute left-4 top-4 z-10 max-w-sm text-sm">
-        {!infoPaneOpen ? (
+
+
+      {/* Top Center Navigation Bar */}
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center">
+        <div className="flex items-center gap-1.5 rounded-full bg-white/95 px-2 py-1.5 shadow-lg ring-1 ring-zinc-200/80 backdrop-blur-md">
+          {/* Map Button */}
           <button
             type="button"
-            onClick={() => setInfoPaneOpen(true)}
-            aria-expanded={false}
-            aria-controls="map-info-pane"
-            className="flex items-center gap-2 rounded-lg bg-white/95 px-3 py-2 font-medium text-zinc-900 shadow-md ring-1 ring-zinc-200 transition hover:bg-white"
+            className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wider bg-green-700 text-white shadow-sm transition-all duration-200"
           >
-            <span>Garupe Mow</span>
-            {selectedIds.length > 0 && (
-              <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-800">
-                {selectedIds.length}
-              </span>
-            )}
-            {!loading && !fetchError && parcelCount > 0 && (
-              <span className="text-xs font-normal text-zinc-500">
-                {parcelCount}
-              </span>
-            )}
+            <svg
+              className="h-3.5 w-3.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"
+              />
+            </svg>
+            <span>Map</span>
           </button>
-        ) : (
-          <div
-            id="map-info-pane"
-            className="rounded-lg bg-white/95 px-4 py-2 shadow-md ring-1 ring-zinc-200"
+
+          {/* Calendar Button (Mock) */}
+          <button
+            type="button"
+            className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wider text-zinc-400 hover:text-zinc-600 transition-all duration-200"
+            title="Calendar (coming soon)"
           >
-            <div className="flex items-start justify-between gap-2">
-              <p className="font-medium text-zinc-900">Garupe Mow</p>
+            <svg
+              className="h-3.5 w-3.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+              />
+            </svg>
+            <span>Calendar</span>
+          </button>
+
+          {/* Separator */}
+          <div className="h-4 w-[1px] bg-zinc-200" />
+
+          {/* Search Section */}
+          <div className="relative">
+            {searchExpanded ? (
+              <div className="flex w-64 items-center gap-1.5 rounded-full bg-zinc-50 border border-zinc-200/80 px-2.5 py-0.5 shadow-inner focus-within:ring-2 focus-within:ring-green-500/20 focus-within:border-green-600 transition-all duration-300">
+                <svg
+                  className="h-3.5 w-3.5 text-zinc-400 shrink-0"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                  />
+                </svg>
+                <input
+                  type="text"
+                  placeholder="Search address or cadastre..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full bg-transparent p-0 text-xs text-zinc-900 outline-none border-0 focus:ring-0 focus:outline-none"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery("");
+                    setSearchExpanded(false);
+                  }}
+                  className="text-zinc-400 hover:text-zinc-600 focus:outline-none shrink-0"
+                >
+                  <svg
+                    className="h-3.5 w-3.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M6 18L18 6M6 6l12 12"
+                    />
+                  </svg>
+                </button>
+              </div>
+            ) : (
               <button
                 type="button"
-                onClick={() => setInfoPaneOpen(false)}
-                aria-expanded={true}
-                aria-controls="map-info-pane"
-                className="shrink-0 rounded-md px-2 py-0.5 text-xs font-medium text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900"
+                onClick={() => setSearchExpanded(true)}
+                className="flex items-center justify-center rounded-full p-1.5 text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 transition-all duration-200"
+                title="Search properties"
               >
-                Minimize
-              </button>
-            </div>
-            {loading && <p className="mt-1 text-zinc-600">Loading properties…</p>}
-            {!loading && !fetchError && (
-              <p className="mt-1 text-zinc-600">
-                {parcelCount > 0
-                  ? `${parcelCount} parcels on map`
-                  : "No parcels to display"}
-              </p>
-            )}
-            {selectedIds.length > 0 && (
-              <p className="mt-1 font-medium text-green-800">
-                {selectedIds.length} selected
-              </p>
-            )}
-            <p className="mt-1 text-xs text-zinc-500">
-              Ctrl+click (⌘ on Mac) to select multiple. Click empty map to
-              clear.
-            </p>
-            <ul className="mt-2 space-y-1 border-t border-zinc-200 pt-2">
-              {PROPERTY_STATUSES.map((status) => (
-                <li
-                  key={status}
-                  className="flex items-center gap-2 text-xs text-zinc-700 capitalize"
+                <svg
+                  className="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  viewBox="0 0 24 24"
                 >
-                  <span
-                    className="h-3 w-3 shrink-0 rounded-sm ring-1 ring-zinc-300"
-                    style={{
-                      backgroundColor: STATUS_MAP_COLORS[status].fill,
-                    }}
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
                   />
-                  {status}
-                </li>
-              ))}
-            </ul>
-            {fetchError && (
-              <p className="mt-1 text-red-600">Failed to load: {fetchError}</p>
+                </svg>
+              </button>
             )}
-            {mapError && (
-              <p className="mt-1 text-red-600">Map error: {mapError}</p>
-            )}
+
+            {/* Search Results Dropdown relative to input */}
+            {searchExpanded && (() => {
+              const normalizedQuery = searchQuery.trim().toLowerCase();
+              const queryTokens = normalizedQuery
+                .replace(/,/g, " ")
+                .normalize("NFD")
+                .replace(/[\u0300-\u036f]/g, "")
+                .split(/\s+/)
+                .filter((token) => {
+                  const noise = [
+                    "iela", "ielas", "ielā",
+                    "ceļš", "ceļā", "cels", "cela",
+                    "līnija", "linija", "līnijas", "linijas",
+                    "prospekts", "street", "str", "st", "road", "rd"
+                  ];
+                  return token && !noise.includes(token);
+                });
+
+              const matchingProperties = queryTokens.length > 0
+                ? properties
+                    .filter((p) => {
+                      const street = (p.street_name || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                      const house = (p.house_number || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                      const cadastre = (p.cadastre_number || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+                      return queryTokens.every((token) => {
+                        if (street.includes(token)) return true;
+                        if (house.startsWith(token)) return true;
+                        if (token.length >= 4 && cadastre.includes(token)) return true;
+                        return false;
+                      });
+                    })
+                    .slice(0, 8)
+                : [];
+
+              if (matchingProperties.length === 0) return null;
+
+              return (
+                <ul className="absolute right-0 mt-2 max-h-60 w-80 overflow-y-auto rounded-lg border border-zinc-200 bg-white/95 py-1.5 shadow-xl backdrop-blur-sm z-50">
+                  {matchingProperties.map((p) => {
+                    const addr = formatAddress(p.street_name, p.house_number) || "Unknown Address";
+                    return (
+                      <li key={p.id}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            zoomToProperty(p);
+                            setSearchQuery("");
+                            setSearchExpanded(false);
+                          }}
+                          className="w-full px-4 py-2.5 text-left text-xs text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 flex flex-col gap-0.5"
+                        >
+                          <span className="font-semibold">{addr}</span>
+                          {p.cadastre_number && (
+                            <span className="text-[10px] text-zinc-400">
+                              Cadastre: {p.cadastre_number}
+                            </span>
+                          )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              );
+            })()}
           </div>
-        )}
+        </div>
       </div>
 
       {bulkMode && (
-        <aside className="absolute right-0 top-0 z-20 flex h-full w-full max-w-md flex-col border-l border-zinc-200 bg-white shadow-2xl">
+        <aside className="absolute right-0 top-0 z-40 flex h-full w-full max-w-md flex-col border-l border-zinc-200 bg-white shadow-2xl">
           <div className="flex items-center justify-between border-b border-zinc-200 px-6 py-4">
             <div>
               <h2 className="text-lg font-semibold text-zinc-900">
@@ -782,7 +937,7 @@ export default function PropertyMapView() {
                 value={bulkStatus}
                 onChange={(e) => setBulkStatus(e.target.value)}
                 disabled={bulkBusy}
-                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 disabled:opacity-60"
+                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 disabled:opacity-60 capitalize"
               >
                 {PROPERTY_STATUSES.map((status) => (
                   <option key={status} value={status} className="capitalize">
@@ -827,7 +982,7 @@ export default function PropertyMapView() {
       )}
 
       {panelOpen && selected && selectedIds.length === 1 && !bulkMode && (
-        <aside className="absolute right-0 top-0 z-20 flex h-full w-full max-w-md flex-col border-l border-zinc-200 bg-white shadow-2xl">
+        <aside className="absolute right-0 top-0 z-40 flex h-full w-full max-w-md flex-col border-l border-zinc-200 bg-white shadow-2xl">
           <div className="flex items-center justify-between border-b border-zinc-200 px-6 py-4">
             <div>
               <h2 className="text-lg font-semibold text-zinc-900">Property</h2>
@@ -859,35 +1014,38 @@ export default function PropertyMapView() {
               </p>
             </div>
 
-            {(
-              [
-                ["client_name", "Client name", "text"],
-                ["phone", "Phone", "tel"],
-                ["email", "Email", "email"],
-              ] as const
-            ).map(([key, label, inputType]) => (
-              <div key={key}>
-                <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
-                  {label}
-                </label>
-                <input
-                  type={inputType}
-                  value={
-                    draft[key] === null || draft[key] === undefined
-                      ? ""
-                      : String(draft[key])
-                  }
-                  onChange={(e) => {
-                    const raw = e.target.value;
-                    setDraft((prev) => ({
-                      ...prev,
-                      [key]: raw || null,
-                    }));
-                  }}
-                  className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
-                />
-              </div>
-            ))}
+            {/* Client Dropdown */}
+            <div>
+              <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                Client
+              </label>
+              <select
+                value={draft.client_id ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setDraft((prev) => ({
+                    ...prev,
+                    client_id: val || null,
+                  }));
+                }}
+                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+              >
+                <option value="">Unassigned</option>
+                {profiles.map((profile) => {
+                  const fullName = [profile.first_name, profile.last_name].filter(Boolean).join(" ");
+                  const displayLabel = fullName 
+                    ? `${fullName}${profile.phone_number ? ` (${profile.phone_number})` : ""}`
+                    : profile.phone_number || "Unnamed profile";
+                  return (
+                    <option key={profile.id} value={profile.id}>
+                      {displayLabel}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+
+
 
             <div>
               <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
@@ -953,7 +1111,7 @@ export default function PropertyMapView() {
                     status: e.target.value || null,
                   }))
                 }
-                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 capitalize"
               >
                 {PROPERTY_STATUSES.map((status) => (
                   <option key={status} value={status} className="capitalize">
@@ -967,102 +1125,113 @@ export default function PropertyMapView() {
               <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
                 Services
               </label>
-              <div className="flex flex-col gap-3 rounded-lg border border-zinc-300 p-3">
-                <div className="flex flex-wrap gap-2">
-                  {["mowing", "trimming", "outside"].map((service) => {
-                    const isSelected = draft.services?.includes(service) ?? false;
-                    return (
-                      <label
-                        key={service}
-                        className={`cursor-pointer select-none rounded-full px-3 py-1 text-xs font-medium transition-colors ${
-                          isSelected
-                            ? "bg-green-100 text-green-800 ring-1 ring-green-600/20"
-                            : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200"
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          className="sr-only"
-                          checked={isSelected}
-                          onChange={(e) => {
-                            const currentServices = draft.services || [];
-                            const checked = e.target.checked;
-                            setDraft((prev) => ({
-                              ...prev,
-                              services: checked
-                                ? [...currentServices, service]
-                                : currentServices.filter((s) => s !== service),
-                            }));
-                          }}
-                        />
-                        <span className="capitalize">{service}</span>
-                      </label>
-                    );
-                  })}
-                </div>
-
-                <div className="flex flex-wrap gap-2">
-                  {(draft.services || [])
-                    .filter((s) => !["mowing", "trimming", "outside"].includes(s))
-                    .map((service) => (
-                      <span
-                        key={service}
-                        className="flex items-center gap-1.5 rounded-full bg-zinc-200 px-3 py-1 text-xs font-medium text-zinc-700"
-                      >
-                        {service}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setDraft((prev) => ({
-                              ...prev,
-                              services: (prev.services || []).filter((s) => s !== service),
-                            }));
-                          }}
-                          className="text-zinc-500 transition hover:text-zinc-900"
-                        >
-                          &times;
-                        </button>
-                      </span>
-                    ))}
-                </div>
-
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder="Add custom tag..."
-                    className="flex-1 rounded-md border border-zinc-300 px-3 py-1.5 text-sm outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        const val = e.currentTarget.value.trim();
-                        if (val && !draft.services?.includes(val)) {
+              <div
+                onClick={() => servicesInputRef.current?.focus()}
+                className="flex flex-wrap items-center gap-1.5 rounded-lg border border-zinc-300 bg-white px-3 py-2 cursor-text transition-all duration-200 outline-none ring-green-500/30 focus-within:border-green-600 focus-within:ring-2 min-h-[46px]"
+              >
+                {(draft.services || []).map((service) => {
+                  const isPredefined = ["mowing", "trimming", "outside"].includes(service);
+                  return (
+                    <span
+                      key={service}
+                      className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium select-none transition-colors ${
+                        isPredefined
+                          ? "bg-green-100 text-green-800 ring-1 ring-green-600/20"
+                          : "bg-zinc-100 text-zinc-700 ring-1 ring-zinc-200"
+                      }`}
+                    >
+                      <span className="capitalize">{service}</span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
                           setDraft((prev) => ({
                             ...prev,
-                            services: [...(prev.services || []), val],
+                            services: (prev.services || []).filter((s) => s !== service),
                           }));
-                          e.currentTarget.value = "";
-                        }
-                      }
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-zinc-800"
-                    onClick={(e) => {
-                      const input = e.currentTarget.previousElementSibling as HTMLInputElement;
-                      const val = input.value.trim();
+                        }}
+                        className={`ml-0.5 rounded-full p-0.5 w-4 h-4 flex items-center justify-center transition-colors duration-150 ${
+                          isPredefined
+                            ? "text-green-600 hover:text-green-900 hover:bg-green-200/50"
+                            : "text-zinc-400 hover:text-zinc-800 hover:bg-zinc-200"
+                        }`}
+                      >
+                        &times;
+                      </button>
+                    </span>
+                  );
+                })}
+                <input
+                  ref={servicesInputRef}
+                  type="text"
+                  placeholder={(draft.services || []).length === 0 ? "Add services..." : ""}
+                  value={servicesInputValue}
+                  onChange={(e) => setServicesInputValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      const val = servicesInputValue.trim().toLowerCase();
                       if (val && !draft.services?.includes(val)) {
                         setDraft((prev) => ({
                           ...prev,
                           services: [...(prev.services || []), val],
                         }));
-                        input.value = "";
                       }
-                    }}
-                  >
-                    Add
-                  </button>
-                </div>
+                      setServicesInputValue("");
+                    } else if (e.key === "Backspace" && servicesInputValue === "") {
+                      const current = draft.services || [];
+                      if (current.length > 0) {
+                        setDraft((prev) => ({
+                          ...prev,
+                          services: current.slice(0, -1),
+                        }));
+                      }
+                    }
+                  }}
+                  className="flex-1 min-w-[80px] bg-transparent text-sm text-zinc-900 outline-none border-0 p-0 focus:outline-none focus:ring-0 focus:border-transparent"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400 mr-1">
+                  Suggestions:
+                </span>
+                {[
+                  "mowing",
+                  "trimming",
+                  "outside",
+                  "gutter cleaning",
+                  "weeding",
+                  "leaf removal",
+                  "pruning",
+                  "fertilizing",
+                  "planting",
+                ].map((service) => {
+                  const isSelected = draft.services?.includes(service) ?? false;
+                  return (
+                    <button
+                      key={service}
+                      type="button"
+                      onClick={() => {
+                        const current = draft.services || [];
+                        setDraft((prev) => ({
+                          ...prev,
+                          services: isSelected
+                            ? current.filter((s) => s !== service)
+                            : [...current, service],
+                        }));
+                      }}
+                      className={`rounded-full px-2 py-0.5 text-xs font-medium border transition-all duration-150 ${
+                        isSelected
+                          ? "bg-green-50 text-green-700 border-green-200 ring-1 ring-green-600/10"
+                          : "bg-zinc-50 text-zinc-500 border-zinc-200 hover:bg-zinc-100 hover:text-zinc-800"
+                      }`}
+                    >
+                      {isSelected ? "✓ " : "+ "}
+                      <span className="capitalize">{service}</span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 

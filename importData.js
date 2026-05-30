@@ -26,9 +26,18 @@ async function startImport() {
   
   const rawData = fs.readFileSync('Garupe_PropertyLines.json', 'utf8');
   const geojson = JSON.parse(rawData);
-  const features = geojson.features;
   
-  console.log(`Found ${features.length} features. Starting upload...`);
+  // 1. Pre-filter the data: remove properties larger than 20,000 sqm (2 hectares)
+  const validFeatures = geojson.features.filter(feature => {
+    const area = Math.round(feature.properties.AREA_SCALE || 0);
+    return area > 0 && area <= 20000;
+  });
+
+  const skippedCount = geojson.features.length - validFeatures.length;
+
+  console.log(`Found ${geojson.features.length} total features.`);
+  console.log(`Skipping ${skippedCount} massive properties (>2ha).`);
+  console.log(`Starting upload for ${validFeatures.length} valid properties...`);
 
   let successCount = 0;
   let errorCount = 0;
@@ -36,16 +45,24 @@ async function startImport() {
   // Upload in smaller batches to avoid overloading the database
   const BATCH_SIZE = 50; 
   
-  for (let i = 0; i < features.length; i += BATCH_SIZE) {
-    const batch = features.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < validFeatures.length; i += BATCH_SIZE) {
+    const batch = validFeatures.slice(i, i + BATCH_SIZE);
     
-    // Supabase automatically converts standard GeoJSON geometry into PostGIS!
+    // 2. Map the JSON data perfectly to our new Supabase table schema
     const rowsToInsert = batch.map(feature => ({
-      geom: feature.geometry, // The map shape
-      client_name: null,      // Empty CRM fields ready for later
+      cadastre_number: feature.properties.CODE,
+      area_sqm: Math.round(feature.properties.AREA_SCALE),
+      geom: feature.geometry,
+      
+      // CRM Fields ready for you to fill out in the app later
+      street_name: null,
+      client_name: null,
       phone: null,
+      email: null,
       mowing_price: null,
-      status: 'Lead'
+      
+      // System States
+      is_archived: false
     }));
 
     const { error } = await supabase.from('properties').insert(rowsToInsert);
@@ -55,12 +72,13 @@ async function startImport() {
       errorCount += batch.length;
     } else {
       successCount += batch.length;
-      console.log(`✅ Uploaded ${successCount} / ${features.length} properties...`);
+      console.log(`✅ Uploaded ${successCount} / ${validFeatures.length} properties...`);
     }
   }
 
   console.log("\n================ IMPORT COMPLETE ================");
   console.log(`✅ Successfully inserted: ${successCount}`);
+  console.log(`🚫 Skipped (>2ha): ${skippedCount}`);
   if (errorCount > 0) console.log(`❌ Failed to insert: ${errorCount}`);
   console.log("=================================================");
 }

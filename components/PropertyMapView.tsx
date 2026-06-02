@@ -13,6 +13,7 @@ import {
 import {
   PROPERTY_STATUSES,
   STATUS_MAP_COLORS,
+  STATUS_DISPLAY_LABELS,
   calculateMowingPrice,
   formatAddress,
   formatLastEdited,
@@ -54,6 +55,8 @@ const emptyDetails = (): PropertyDetails => ({
   last_edited_at: null,
   status: null,
   services: [],
+  mowing_frequency: null,
+  last_mowed: null,
 });
 
 function parseOptionalNumber(value: unknown): number | null {
@@ -92,6 +95,8 @@ function detailsFromFeatureProps(
     last_edited_at: parseOptionalString(props.last_edited_at),
     status: parseOptionalString(props.status)?.toLowerCase() || null,
     services: parsedServices,
+    mowing_frequency: parseOptionalString(props.mowing_frequency),
+    last_mowed: parseOptionalString(props.last_mowed),
   };
 }
 
@@ -113,7 +118,7 @@ type UndoSnapshot = {
   draft: PropertyDetails;
 };
 
-export default function PropertyMapView() {
+export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: () => void } = {}) {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<Map | null>(null);
   const hoveredIdRef = useRef<string | number | null>(null);
@@ -548,6 +553,21 @@ export default function PropertyMapView() {
     setSaving(true);
     setSaveError(null);
 
+    const normalizedStatus = draft.status?.trim().toLowerCase() || null;
+    
+    if (normalizedStatus === "active") {
+      if (!draft.mowing_frequency || !draft.last_mowed) {
+        setSaveError("An 'Active' property requires both a mowing frequency and a last mowed date.");
+        setSaving(false);
+        return;
+      }
+      if (!draft.client_id) {
+        setSaveError("An 'Active' property must have a Client assigned.");
+        setSaving(false);
+        return;
+      }
+    }
+
     const payload = {
       client_id: draft.client_id || null,
       mowing_price:
@@ -556,6 +576,8 @@ export default function PropertyMapView() {
           : Number(draft.mowing_price),
       status: draft.status?.trim() || null,
       services: draft.services || [],
+      mowing_frequency: draft.mowing_frequency || null,
+      last_mowed: draft.last_mowed || null,
       last_edited_at: new Date().toISOString(),
     };
 
@@ -617,7 +639,20 @@ export default function PropertyMapView() {
     setBulkSaving(true);
     setBulkError(null);
 
-    const status = bulkStatus.trim() || "new";
+    const status = bulkStatus.trim() || "uncontacted";
+    
+    if (status.toLowerCase() === "active") {
+      const idSet = new Set(selectedIds);
+      const invalidRows = properties.filter((r) => 
+        idSet.has(r.id) && (!r.mowing_frequency || !r.last_mowed || !r.client_id)
+      );
+      if (invalidRows.length > 0) {
+        setBulkError(`Cannot set ${invalidRows.length} properties to 'Active' because they are missing a 'Mowing Frequency', 'Last Mowed' date, or 'Client'.`);
+        setBulkSaving(false);
+        return;
+      }
+    }
+
     const { error } = await bulkStatusUpdateAction(selectedIds, status);
 
     if (error) {
@@ -676,6 +711,8 @@ export default function PropertyMapView() {
     draft.client_id !== selected.client_id ||
     draft.mowing_price !== selected.mowing_price ||
     draft.status !== selected.status ||
+    draft.mowing_frequency !== selected.mowing_frequency ||
+    draft.last_mowed !== selected.last_mowed ||
     JSON.stringify(draft.services || []) !== JSON.stringify(selected.services || [])
   ) : false;
 
@@ -742,11 +779,11 @@ export default function PropertyMapView() {
             <span>Map</span>
           </button>
 
-          {/* Calendar Button (Mock) */}
+          {/* Calendar Button */}
           <button
             type="button"
+            onClick={onViewCalendar}
             className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wider text-zinc-400 hover:text-zinc-600 transition-all duration-200"
-            title="Calendar (coming soon)"
           >
             <svg
               className="h-3.5 w-3.5"
@@ -940,8 +977,8 @@ export default function PropertyMapView() {
                 className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 disabled:opacity-60 capitalize"
               >
                 {PROPERTY_STATUSES.map((status) => (
-                  <option key={status} value={status} className="capitalize">
-                    {status}
+                  <option key={status} value={status}>
+                    {STATUS_DISPLAY_LABELS[status]}
                   </option>
                 ))}
               </select>
@@ -1114,11 +1151,50 @@ export default function PropertyMapView() {
                 className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 capitalize"
               >
                 {PROPERTY_STATUSES.map((status) => (
-                  <option key={status} value={status} className="capitalize">
-                    {status}
+                  <option key={status} value={status}>
+                    {STATUS_DISPLAY_LABELS[status]}
                   </option>
                 ))}
               </select>
+            </div>
+
+            <div>
+              <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                Mowing Frequency
+              </label>
+              <select
+                value={draft.mowing_frequency ?? "bi-weekly"}
+                onChange={(e) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    mowing_frequency: e.target.value || null,
+                  }))
+                }
+                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 capitalize"
+              >
+                <option value="weekly">Weekly</option>
+                <option value="bi-weekly">Bi-weekly</option>
+                <option value="monthly">Monthly</option>
+                <option value="10">Every 10 Days</option>
+                <option value="21">Every 3 Weeks</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                Last Mowed Date
+              </label>
+              <input
+                type="date"
+                value={draft.last_mowed ?? ""}
+                onChange={(e) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    last_mowed: e.target.value || null,
+                  }))
+                }
+                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+              />
             </div>
 
             <div>

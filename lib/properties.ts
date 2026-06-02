@@ -28,6 +28,8 @@ export type PropertyRow = {
   last_edited_at: string | null;
   status: string | null;
   services: string[] | null;
+  mowing_frequency: string | null;
+  last_mowed: string | null;
 };
 
 export type PropertyDetails = Omit<PropertyRow, "geom">;
@@ -37,6 +39,32 @@ export type ProfileRow = {
   first_name: string | null;
   last_name: string | null;
   phone_number: string | null;
+};
+
+export type BookingStatus = "scheduled" | "completed" | "skipped" | "cancelled";
+
+export type BookingRow = {
+  id: string;
+  property_id: string;
+  scheduled_date: string;
+  status: BookingStatus;
+  notes: string | null;
+  actual_price: number | null;
+  completed_at: string | null;
+  created_at: string;
+};
+
+export type BookingWithProperty = BookingRow & {
+  properties: {
+    id: string;
+    cadastre_number: string | null;
+    street_name: string | null;
+    house_number: string | null;
+    area_sqm: number | null;
+    mowing_price: number | null;
+    client_id: string | null;
+    mowing_frequency: string | null;
+  } | null;
 };
 
 export function formatAddress(
@@ -57,24 +85,32 @@ export function formatLastEdited(value: string | null | undefined): string {
 }
 
 export const PROPERTY_STATUSES = [
-  "new",
+  "uncontacted",
   "contacted",
   "active",
-  "completed",
+  "refused",
   "archived",
 ] as const;
 
 export type PropertyStatus = (typeof PROPERTY_STATUSES)[number];
+
+export const STATUS_DISPLAY_LABELS: Record<PropertyStatus, string> = {
+  uncontacted: "Uncontacted",
+  contacted: "Contacted",
+  active: "Active",
+  refused: "Refused",
+  archived: "Archived",
+};
 
 /** Map fill / outline colors per status (MapLibre `#rrggbb`). */
 export const STATUS_MAP_COLORS: Record<
   PropertyStatus,
   { fill: string; outline: string }
 > = {
-  new: { fill: "#e4e4e7", outline: "#a1a1aa" }, // Light gray
+  uncontacted: { fill: "#e4e4e7", outline: "#a1a1aa" }, // Light gray
   contacted: { fill: "#60a5fa", outline: "#1d4ed8" }, // Blue
   active: { fill: "#22c55e", outline: "#14532d" }, // Green
-  completed: { fill: "#c084fc", outline: "#7e22ce" }, // Purple
+  refused: { fill: "#f87171", outline: "#b91c1c" }, // Rose / Red
   archived: { fill: "#52525b", outline: "#27272a" }, // Dark gray
 };
 
@@ -145,6 +181,8 @@ export function rowsToFeatureCollection(
         last_edited_at: row.last_edited_at,
         status: row.status,
         services: row.services,
+        mowing_frequency: row.mowing_frequency,
+        last_mowed: row.last_mowed,
       },
     });
   }

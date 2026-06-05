@@ -30,6 +30,8 @@ export type PropertyRow = {
   services: string[] | null;
   mowing_frequency: string | null;
   last_mowed: string | null;
+  first_scheduled_date: string | null;
+  service_type: "recurring" | "on-demand";
 };
 
 export type PropertyDetails = Omit<PropertyRow, "geom">;
@@ -64,6 +66,7 @@ export type BookingWithProperty = BookingRow & {
     mowing_price: number | null;
     client_id: string | null;
     mowing_frequency: string | null;
+    services: string[] | null;
   } | null;
 };
 
@@ -183,6 +186,8 @@ export function rowsToFeatureCollection(
         services: row.services,
         mowing_frequency: row.mowing_frequency,
         last_mowed: row.last_mowed,
+        first_scheduled_date: row.first_scheduled_date,
+        service_type: row.service_type,
       },
     });
   }
@@ -235,4 +240,28 @@ export function calculateMowingPrice(
 
   // Round to the nearest whole Euro for clean CRM billing
   return Math.round(finalPrice);
+}
+
+/**
+ * If a date lands on Saturday or Sunday, snaps it to the preceding Friday (default) to keep operations weekday-only.
+ */
+export function calculateNextWorkingDay(date: Date | string): Date {
+  let d: Date;
+  if (typeof date === "string") {
+    const parts = date.split("-").map(Number);
+    if (parts.length === 3 && !parts.some(isNaN)) {
+      d = new Date(parts[0], parts[1] - 1, parts[2]);
+    } else {
+      d = new Date(date);
+    }
+  } else {
+    d = new Date(date.getTime());
+  }
+  const day = d.getDay(); // 0 = Sunday, 6 = Saturday
+  if (day === 6) { // Saturday
+    d.setDate(d.getDate() - 1); // preceding Friday
+  } else if (day === 0) { // Sunday
+    d.setDate(d.getDate() - 2); // preceding Friday
+  }
+  return d;
 }

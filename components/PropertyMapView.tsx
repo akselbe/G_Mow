@@ -8,9 +8,6 @@ import maplibregl, {
 } from "maplibre-gl";
 
 import {
-  clonePropertyRows,
-} from "@/lib/syncPropertiesUndo";
-import {
   PROPERTY_STATUSES,
   STATUS_MAP_COLORS,
   STATUS_DISPLAY_LABELS,
@@ -33,7 +30,9 @@ import {
   deletePropertyAction,
   bulkStatusUpdateAction,
   bulkDeleteAction,
-  syncPropertiesToSnapshotAction,
+  undoDeletePropertyAction,
+  undoPropertyEditsAction,
+  searchPropertiesAction,
 } from "@/app/actions/properties";
 
 const GARUPE_CENTER: [number, number] = [24.24, 57.12];
@@ -57,6 +56,8 @@ const emptyDetails = (): PropertyDetails => ({
   services: [],
   mowing_frequency: null,
   last_mowed: null,
+  first_scheduled_date: null,
+  service_type: "on-demand",
 });
 
 function parseOptionalNumber(value: unknown): number | null {
@@ -97,6 +98,8 @@ function detailsFromFeatureProps(
     services: parsedServices,
     mowing_frequency: parseOptionalString(props.mowing_frequency),
     last_mowed: parseOptionalString(props.last_mowed),
+    first_scheduled_date: parseOptionalString(props.first_scheduled_date),
+    service_type: (parseOptionalString(props.service_type) as "recurring" | "on-demand") || "on-demand",
   };
 }
 
@@ -109,13 +112,10 @@ function isMultiSelectKey(e: MouseEvent | PointerEvent): boolean {
   return e.ctrlKey || e.metaKey || e.shiftKey;
 }
 
-type UndoSnapshot = {
+type UndoAction = {
+  type: "edit" | "delete";
+  propertyIds: string[];
   label: string;
-  properties: PropertyRow[];
-  selectedIds: string[];
-  selected: PropertyDetails | null;
-  panelOpen: boolean;
-  draft: PropertyDetails;
 };
 
 export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: () => void } = {}) {
@@ -148,26 +148,16 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchExpanded, setSearchExpanded] = useState(false);
+  const [searchResults, setSearchResults] = useState<PropertyRow[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
 
   const [bulkStatus, setBulkStatus] = useState<string>("active");
   const [bulkSaving, setBulkSaving] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [bulkError, setBulkError] = useState<string | null>(null);
-  const [undoSnapshot, setUndoSnapshot] = useState<UndoSnapshot | null>(null);
+  const [undoAction, setUndoAction] = useState<UndoAction | null>(null);
   const [undoing, setUndoing] = useState(false);
   const [undoError, setUndoError] = useState<string | null>(null);
-
-  const captureUndo = useCallback(
-    (label: string): UndoSnapshot => ({
-      label,
-      properties: clonePropertyRows(properties),
-      selectedIds: [...selectedIds],
-      selected: selected ? { ...selected } : null,
-      panelOpen,
-      draft: { ...draft },
-    }),
-    [properties, selectedIds, selected, panelOpen, draft]
-  );
 
   const syncMapData = useCallback((collection: GeoJsonFeatureCollection) => {
     geojsonRef.current = collection;
@@ -198,42 +188,44 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
     selectedIdsRef.current = nextSet;
   }, []);
 
-  const restoreUiFromUndo = useCallback(
-    (snapshot: UndoSnapshot) => {
-      applyMapSelection(snapshot.selectedIds);
-      setSelectedIds(snapshot.selectedIds);
-      setPanelOpen(snapshot.panelOpen);
-      setSelected(snapshot.selected);
-      setDraft(snapshot.draft);
-      setSaveError(null);
-      setBulkError(null);
-    },
-    [applyMapSelection]
-  );
-
   const handleUndo = useCallback(async () => {
-    if (!undoSnapshot) return;
+    if (!undoAction) return;
 
     setUndoing(true);
     setUndoError(null);
 
-    const { error } = await syncPropertiesToSnapshotAction(
-      undoSnapshot.properties,
-      properties
-    );
+    let res: { error: string | null };
+    if (undoAction.type === "delete") {
+      res = await undoDeletePropertyAction(undoAction.propertyIds);
+    } else {
+      res = await undoPropertyEditsAction(undoAction.propertyIds);
+    }
 
-    if (error) {
-      setUndoError(error);
+    if (res.error) {
+      setUndoError(res.error);
       setUndoing(false);
       return;
     }
 
-    setProperties(undoSnapshot.properties);
-    syncMapData(rowsToFeatureCollection(undoSnapshot.properties));
-    restoreUiFromUndo(undoSnapshot);
-    setUndoSnapshot(null);
+    const updatedRows = await loadProperties();
+    applyMapSelection(undoAction.propertyIds);
+    setSelectedIds(undoAction.propertyIds);
+
+    if (undoAction.propertyIds.length === 1 && updatedRows) {
+      const row = updatedRows.find((r) => r.id === undoAction.propertyIds[0]);
+      if (row) {
+        setSelected(detailsFromRow(row));
+        setDraft(detailsFromRow(row));
+        setPanelOpen(true);
+      }
+    } else {
+      setPanelOpen(false);
+      setSelected(null);
+    }
+
+    setUndoAction(null);
     setUndoing(false);
-  }, [undoSnapshot, properties, syncMapData, restoreUiFromUndo]);
+  }, [undoAction, applyMapSelection]);
 
   const clearSelection = useCallback(() => {
     applyMapSelection([]);
@@ -328,8 +320,8 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
     setProfiles(profilesRes.profiles);
     setProperties(normalizedRows);
     syncMapData(rowsToFeatureCollection(normalizedRows));
-    setUndoSnapshot(null);
     setLoading(false);
+    return normalizedRows;
   }, [syncMapData]);
 
   const zoomToProperty = useCallback((property: PropertyRow) => {
@@ -368,6 +360,49 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
       setPanelOpen(true);
     }
   }, [updateSelection]);
+
+  // Clean search input: lowercase and remove "iela", "ceļš", "līnija", "gatve"
+  const sanitizeSearchInput = (input: string): string => {
+    const noiseWords = new Set(["iela", "ceļš", "līnija", "gatve"]);
+    return input
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(word => !noiseWords.has(word))
+      .join(" ")
+      .trim();
+  };
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (!query) {
+      setSearchResults([]);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setSearchLoading(true);
+      const sanitized = sanitizeSearchInput(query);
+      if (!sanitized) {
+        setSearchResults([]);
+        setSearchLoading(false);
+        return;
+      }
+
+      const { rows, error } = await searchPropertiesAction(sanitized);
+      if (!error && rows) {
+        const normalized = rows.map((row) => ({
+          ...row,
+          status: row.status ? row.status.toLowerCase() : null,
+        }));
+        setSearchResults(normalized);
+      } else {
+        setSearchResults([]);
+      }
+      setSearchLoading(false);
+    }, 300);
+
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   useEffect(() => {
     loadProperties();
@@ -556,13 +591,13 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
     const normalizedStatus = draft.status?.trim().toLowerCase() || null;
     
     if (normalizedStatus === "active") {
-      if (!draft.mowing_frequency || !draft.last_mowed) {
-        setSaveError("An 'Active' property requires both a mowing frequency and a last mowed date.");
+      if (!draft.client_id) {
+        setSaveError("An 'Active' property must have a Client assigned.");
         setSaving(false);
         return;
       }
-      if (!draft.client_id) {
-        setSaveError("An 'Active' property must have a Client assigned.");
+      if (!draft.last_mowed && !draft.first_scheduled_date) {
+        setSaveError("An 'Active' property requires either a 'Last Mowed' date or a 'First Scheduled' date.");
         setSaving(false);
         return;
       }
@@ -576,8 +611,10 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
           : Number(draft.mowing_price),
       status: draft.status?.trim() || null,
       services: draft.services || [],
-      mowing_frequency: draft.mowing_frequency || null,
+      mowing_frequency: draft.service_type === "on-demand" ? null : (draft.mowing_frequency || "bi-weekly"),
       last_mowed: draft.last_mowed || null,
+      first_scheduled_date: draft.first_scheduled_date || null,
+      service_type: draft.service_type || "on-demand",
       last_edited_at: new Date().toISOString(),
     };
 
@@ -589,7 +626,11 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
       return;
     }
 
-    setUndoSnapshot(captureUndo("Saved property"));
+    setUndoAction({
+      type: "edit",
+      propertyIds: [selected.id],
+      label: "Saved property",
+    });
 
     const updatedRows = properties.map((row) =>
       row.id === selected.id ? { ...row, ...payload } : row
@@ -624,7 +665,11 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
       return;
     }
 
-    setUndoSnapshot(captureUndo("Deleted property"));
+    setUndoAction({
+      type: "delete",
+      propertyIds: [selected.id],
+      label: "Deleted property",
+    });
 
     const updatedRows = properties.filter((row) => row.id !== selected.id);
     setProperties(updatedRows);
@@ -643,11 +688,18 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
     
     if (status.toLowerCase() === "active") {
       const idSet = new Set(selectedIds);
-      const invalidRows = properties.filter((r) => 
-        idSet.has(r.id) && (!r.mowing_frequency || !r.last_mowed || !r.client_id)
-      );
+      const invalidRows = properties.filter((r) => {
+        if (!idSet.has(r.id)) return false;
+        
+        const hasClient = !!r.client_id;
+        const hasDate = !!r.last_mowed || !!r.first_scheduled_date;
+        const hasFreqIfRecurring = r.service_type !== "on-demand" ? !!r.mowing_frequency : true;
+        
+        return !hasClient || !hasDate || !hasFreqIfRecurring;
+      });
+
       if (invalidRows.length > 0) {
-        setBulkError(`Cannot set ${invalidRows.length} properties to 'Active' because they are missing a 'Mowing Frequency', 'Last Mowed' date, or 'Client'.`);
+        setBulkError(`Cannot set ${invalidRows.length} properties to 'Active' because they are missing a Client, a scheduling date ('Last Mowed' or 'First Scheduled'), or a Mowing Frequency (for recurring properties).`);
         setBulkSaving(false);
         return;
       }
@@ -661,7 +713,11 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
       return;
     }
 
-    setUndoSnapshot(captureUndo(`Updated status on ${selectedIds.length} parcels`));
+    setUndoAction({
+      type: "edit",
+      propertyIds: [...selectedIds],
+      label: `Updated status on ${selectedIds.length} parcels`,
+    });
 
     const idSet = new Set(selectedIds);
     const updatedRows = properties.map((row) =>
@@ -686,7 +742,11 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
       return;
     }
 
-    setUndoSnapshot(captureUndo(`Deleted ${selectedIds.length} parcels`));
+    setUndoAction({
+      type: "delete",
+      propertyIds: [...selectedIds],
+      label: `Deleted ${selectedIds.length} parcels`,
+    });
 
     const idSet = new Set(selectedIds);
     const updatedRows = properties.filter((row) => !idSet.has(row.id));
@@ -713,6 +773,8 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
     draft.status !== selected.status ||
     draft.mowing_frequency !== selected.mowing_frequency ||
     draft.last_mowed !== selected.last_mowed ||
+    draft.first_scheduled_date !== selected.first_scheduled_date ||
+    draft.service_type !== selected.service_type ||
     JSON.stringify(draft.services || []) !== JSON.stringify(selected.services || [])
   ) : false;
 
@@ -735,7 +797,7 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
         </div>
       )}
 
-      {undoSnapshot && (
+      {undoAction && (
         <div className="absolute bottom-6 left-1/2 z-30 flex -translate-x-1/2 flex-col items-center gap-2">
           <button
             type="button"
@@ -743,7 +805,7 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
             disabled={undoing || saving || deleting || bulkBusy}
             className="rounded-full bg-zinc-900 px-5 py-2.5 text-sm font-semibold text-white shadow-lg transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {undoing ? "Undoing…" : `Undo: ${undoSnapshot.label}`}
+            {undoing ? "Undoing…" : `Undo: ${undoAction.label}`}
           </button>
           {undoError && (
             <p className="max-w-xs rounded-lg bg-red-50 px-3 py-2 text-center text-xs text-red-700 shadow">
@@ -833,6 +895,7 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
                   type="button"
                   onClick={() => {
                     setSearchQuery("");
+                    setSearchResults([]);
                     setSearchExpanded(false);
                   }}
                   className="text-zinc-400 hover:text-zinc-600 focus:outline-none shrink-0"
@@ -875,71 +938,34 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
               </button>
             )}
 
-            {/* Search Results Dropdown relative to input */}
-            {searchExpanded && (() => {
-              const normalizedQuery = searchQuery.trim().toLowerCase();
-              const queryTokens = normalizedQuery
-                .replace(/,/g, " ")
-                .normalize("NFD")
-                .replace(/[\u0300-\u036f]/g, "")
-                .split(/\s+/)
-                .filter((token) => {
-                  const noise = [
-                    "iela", "ielas", "ielā",
-                    "ceļš", "ceļā", "cels", "cela",
-                    "līnija", "linija", "līnijas", "linijas",
-                    "prospekts", "street", "str", "st", "road", "rd"
-                  ];
-                  return token && !noise.includes(token);
-                });
-
-              const matchingProperties = queryTokens.length > 0
-                ? properties
-                    .filter((p) => {
-                      const street = (p.street_name || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-                      const house = (p.house_number || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-                      const cadastre = (p.cadastre_number || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-
-                      return queryTokens.every((token) => {
-                        if (street.includes(token)) return true;
-                        if (house.startsWith(token)) return true;
-                        if (token.length >= 4 && cadastre.includes(token)) return true;
-                        return false;
-                      });
-                    })
-                    .slice(0, 8)
-                : [];
-
-              if (matchingProperties.length === 0) return null;
-
-              return (
-                <ul className="absolute right-0 mt-2 max-h-60 w-80 overflow-y-auto rounded-lg border border-zinc-200 bg-white/95 py-1.5 shadow-xl backdrop-blur-sm z-50">
-                  {matchingProperties.map((p) => {
-                    const addr = formatAddress(p.street_name, p.house_number) || "Unknown Address";
-                    return (
-                      <li key={p.id}>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            zoomToProperty(p);
-                            setSearchQuery("");
-                            setSearchExpanded(false);
-                          }}
-                          className="w-full px-4 py-2.5 text-left text-xs text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 flex flex-col gap-0.5"
-                        >
-                          <span className="font-semibold">{addr}</span>
-                          {p.cadastre_number && (
-                            <span className="text-[10px] text-zinc-400">
-                              Cadastre: {p.cadastre_number}
-                            </span>
-                          )}
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ul>
-              );
-            })()}
+            {searchExpanded && searchResults.length > 0 && (
+              <ul className="absolute right-0 mt-2 max-h-60 w-80 overflow-y-auto rounded-lg border border-zinc-200 bg-white/95 py-1.5 shadow-xl backdrop-blur-sm z-50">
+                {searchResults.map((p) => {
+                  const addr = formatAddress(p.street_name, p.house_number) || "Unknown Address";
+                  return (
+                    <li key={p.id}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          zoomToProperty(p);
+                          setSearchQuery("");
+                          setSearchResults([]);
+                          setSearchExpanded(false);
+                        }}
+                        className="w-full px-4 py-2.5 text-left text-xs text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 flex flex-col gap-0.5"
+                      >
+                        <span className="font-semibold">{addr}</span>
+                        {p.cadastre_number && (
+                          <span className="text-[10px] text-zinc-400">
+                            Cadastre: {p.cadastre_number}
+                          </span>
+                        )}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
           </div>
         </div>
       </div>
@@ -1052,37 +1078,37 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
             </div>
 
             {/* Client Dropdown */}
-            <div>
-              <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
-                Client
-              </label>
-              <select
-                value={draft.client_id ?? ""}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setDraft((prev) => ({
-                    ...prev,
-                    client_id: val || null,
-                  }));
-                }}
-                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
-              >
-                <option value="">Unassigned</option>
-                {profiles.map((profile) => {
-                  const fullName = [profile.first_name, profile.last_name].filter(Boolean).join(" ");
-                  const displayLabel = fullName 
-                    ? `${fullName}${profile.phone_number ? ` (${profile.phone_number})` : ""}`
-                    : profile.phone_number || "Unnamed profile";
-                  return (
-                    <option key={profile.id} value={profile.id}>
-                      {displayLabel}
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
-
-
+            {draft.status !== "uncontacted" && (
+              <div>
+                <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                  Client
+                </label>
+                <select
+                  value={draft.client_id ?? ""}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setDraft((prev) => ({
+                      ...prev,
+                      client_id: val || null,
+                    }));
+                  }}
+                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+                >
+                  <option value="">Unassigned</option>
+                  {profiles.map((profile) => {
+                    const fullName = [profile.first_name, profile.last_name].filter(Boolean).join(" ");
+                    const displayLabel = fullName 
+                      ? `${fullName}${profile.phone_number ? ` (${profile.phone_number})` : ""}`
+                      : profile.phone_number || "Unnamed profile";
+                    return (
+                      <option key={profile.id} value={profile.id}>
+                        {displayLabel}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+            )}
 
             <div>
               <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
@@ -1100,7 +1126,7 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
                 <label className="block text-xs font-medium uppercase tracking-wide text-zinc-500">
                   Mowing price (€)
                 </label>
-                {selected.area_sqm !== null && selected.area_sqm !== undefined && (
+                {draft.status === "active" && selected.area_sqm !== null && selected.area_sqm !== undefined && (
                   <button
                     type="button"
                     onClick={() => {
@@ -1117,23 +1143,29 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
                   </button>
                 )}
               </div>
-              <input
-                type="number"
-                value={
-                  draft.mowing_price === null ||
-                  draft.mowing_price === undefined
-                    ? ""
-                    : String(draft.mowing_price)
-                }
-                onChange={(e) => {
-                  const raw = e.target.value;
-                  setDraft((prev) => ({
-                    ...prev,
-                    mowing_price: raw === "" ? null : Number(raw),
-                  }));
-                }}
-                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
-              />
+              {draft.status === "active" ? (
+                <input
+                  type="number"
+                  value={
+                    draft.mowing_price === null ||
+                    draft.mowing_price === undefined
+                      ? ""
+                      : String(draft.mowing_price)
+                  }
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    setDraft((prev) => ({
+                      ...prev,
+                      mowing_price: raw === "" ? null : Number(raw),
+                    }));
+                  }}
+                  className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+                />
+              ) : (
+                <p className="rounded-lg bg-zinc-50 px-3 py-2 text-sm text-zinc-900">
+                  €{selected.area_sqm ? calculateMowingPrice(selected.area_sqm, draft.services?.includes("trimming") ?? false, draft.services?.includes("outside") ?? false) : "—"} (Estimated Standard Price)
+                </p>
+              )}
             </div>
 
             <div>
@@ -1158,158 +1190,202 @@ export default function PropertyMapView({ onViewCalendar }: { onViewCalendar?: (
               </select>
             </div>
 
-            <div>
-              <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
-                Mowing Frequency
-              </label>
-              <select
-                value={draft.mowing_frequency ?? "bi-weekly"}
-                onChange={(e) =>
-                  setDraft((prev) => ({
-                    ...prev,
-                    mowing_frequency: e.target.value || null,
-                  }))
-                }
-                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 capitalize"
-              >
-                <option value="weekly">Weekly</option>
-                <option value="bi-weekly">Bi-weekly</option>
-                <option value="monthly">Monthly</option>
-                <option value="10">Every 10 Days</option>
-                <option value="21">Every 3 Weeks</option>
-              </select>
-            </div>
+            {draft.status === "active" && (
+              <>
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Service Type
+                  </label>
+                  <select
+                    value={draft.service_type ?? "on-demand"}
+                    onChange={(e) => {
+                      const val = e.target.value as "recurring" | "on-demand";
+                      setDraft((prev) => ({
+                        ...prev,
+                        service_type: val,
+                        mowing_frequency: val === "recurring" ? (prev.mowing_frequency || "bi-weekly") : null,
+                      }));
+                    }}
+                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+                  >
+                    <option value="recurring">Recurring</option>
+                    <option value="on-demand">On-Demand</option>
+                  </select>
+                </div>
 
-            <div>
-              <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
-                Last Mowed Date
-              </label>
-              <input
-                type="date"
-                value={draft.last_mowed ?? ""}
-                onChange={(e) =>
-                  setDraft((prev) => ({
-                    ...prev,
-                    last_mowed: e.target.value || null,
-                  }))
-                }
-                className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
-              />
-            </div>
-
-            <div>
-              <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
-                Services
-              </label>
-              <div
-                onClick={() => servicesInputRef.current?.focus()}
-                className="flex flex-wrap items-center gap-1.5 rounded-lg border border-zinc-300 bg-white px-3 py-2 cursor-text transition-all duration-200 outline-none ring-green-500/30 focus-within:border-green-600 focus-within:ring-2 min-h-[46px]"
-              >
-                {(draft.services || []).map((service) => {
-                  const isPredefined = ["mowing", "trimming", "outside"].includes(service);
-                  return (
-                    <span
-                      key={service}
-                      className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium select-none transition-colors ${
-                        isPredefined
-                          ? "bg-green-100 text-green-800 ring-1 ring-green-600/20"
-                          : "bg-zinc-100 text-zinc-700 ring-1 ring-zinc-200"
-                      }`}
+                {draft.service_type !== "on-demand" && (
+                  <div>
+                    <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                      Mowing Frequency
+                    </label>
+                    <select
+                      value={draft.mowing_frequency ?? "bi-weekly"}
+                      onChange={(e) =>
+                        setDraft((prev) => ({
+                          ...prev,
+                          mowing_frequency: e.target.value || null,
+                        }))
+                      }
+                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2 capitalize"
                     >
-                      <span className="capitalize">{service}</span>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setDraft((prev) => ({
-                            ...prev,
-                            services: (prev.services || []).filter((s) => s !== service),
-                          }));
-                        }}
-                        className={`ml-0.5 rounded-full p-0.5 w-4 h-4 flex items-center justify-center transition-colors duration-150 ${
-                          isPredefined
-                            ? "text-green-600 hover:text-green-900 hover:bg-green-200/50"
-                            : "text-zinc-400 hover:text-zinc-800 hover:bg-zinc-200"
-                        }`}
-                      >
-                        &times;
-                      </button>
-                    </span>
-                  );
-                })}
-                <input
-                  ref={servicesInputRef}
-                  type="text"
-                  placeholder={(draft.services || []).length === 0 ? "Add services..." : ""}
-                  value={servicesInputValue}
-                  onChange={(e) => setServicesInputValue(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      const val = servicesInputValue.trim().toLowerCase();
-                      if (val && !draft.services?.includes(val)) {
-                        setDraft((prev) => ({
-                          ...prev,
-                          services: [...(prev.services || []), val],
-                        }));
-                      }
-                      setServicesInputValue("");
-                    } else if (e.key === "Backspace" && servicesInputValue === "") {
-                      const current = draft.services || [];
-                      if (current.length > 0) {
-                        setDraft((prev) => ({
-                          ...prev,
-                          services: current.slice(0, -1),
-                        }));
-                      }
+                      <option value="weekly">Weekly</option>
+                      <option value="bi-weekly">Bi-weekly</option>
+                      <option value="monthly">Monthly</option>
+                      <option value="10">Every 10 Days</option>
+                      <option value="21">Every 3 Weeks</option>
+                    </select>
+                  </div>
+                )}
+
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Last Mowed Date
+                  </label>
+                  <input
+                    type="date"
+                    value={draft.last_mowed ?? ""}
+                    onChange={(e) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        last_mowed: e.target.value || null,
+                      }))
                     }
-                  }}
-                  className="flex-1 min-w-[80px] bg-transparent text-sm text-zinc-900 outline-none border-0 p-0 focus:outline-none focus:ring-0 focus:border-transparent"
-                />
-              </div>
+                    className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+                  />
+                </div>
 
-              <div className="flex flex-wrap items-center gap-1.5 mt-2">
-                <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400 mr-1">
-                  Suggestions:
-                </span>
-                {[
-                  "mowing",
-                  "trimming",
-                  "outside",
-                  "gutter cleaning",
-                  "weeding",
-                  "leaf removal",
-                  "pruning",
-                  "fertilizing",
-                  "planting",
-                ].map((service) => {
-                  const isSelected = draft.services?.includes(service) ?? false;
-                  return (
-                    <button
-                      key={service}
-                      type="button"
-                      onClick={() => {
-                        const current = draft.services || [];
-                        setDraft((prev) => ({
-                          ...prev,
-                          services: isSelected
-                            ? current.filter((s) => s !== service)
-                            : [...current, service],
-                        }));
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    First Scheduled Date
+                  </label>
+                  <input
+                    type="date"
+                    value={draft.first_scheduled_date ?? ""}
+                    onChange={(e) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        first_scheduled_date: e.target.value || null,
+                      }))
+                    }
+                    className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 outline-none ring-green-500/30 transition focus:border-green-600 focus:ring-2"
+                  />
+                </div>
+
+                <div>
+                  <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Services
+                  </label>
+                  <div
+                    onClick={() => servicesInputRef.current?.focus()}
+                    className="flex flex-wrap items-center gap-1.5 rounded-lg border border-zinc-300 bg-white px-3 py-2 cursor-text transition-all duration-200 outline-none ring-green-500/30 focus-within:border-green-600 focus-within:ring-2 min-h-[46px]"
+                  >
+                    {(draft.services || []).map((service) => {
+                      const isPredefined = ["mowing", "trimming", "outside"].includes(service);
+                      return (
+                        <span
+                          key={service}
+                          className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium select-none transition-colors ${
+                            isPredefined
+                              ? "bg-green-100 text-green-800 ring-1 ring-green-600/20"
+                              : "bg-zinc-100 text-zinc-700 ring-1 ring-zinc-200"
+                          }`}
+                        >
+                          <span className="capitalize">{service}</span>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setDraft((prev) => ({
+                                ...prev,
+                                services: (prev.services || []).filter((s) => s !== service),
+                              }));
+                            }}
+                            className={`ml-0.5 rounded-full p-0.5 w-4 h-4 flex items-center justify-center transition-colors duration-150 ${
+                              isPredefined
+                                ? "text-green-600 hover:text-green-900 hover:bg-green-200/50"
+                                : "text-zinc-400 hover:text-zinc-800 hover:bg-zinc-200"
+                            }`}
+                          >
+                            &times;
+                          </button>
+                        </span>
+                      );
+                    })}
+                    <input
+                      ref={servicesInputRef}
+                      type="text"
+                      placeholder={(draft.services || []).length === 0 ? "Add services..." : ""}
+                      value={servicesInputValue}
+                      onChange={(e) => setServicesInputValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          const val = servicesInputValue.trim().toLowerCase();
+                          if (val && !draft.services?.includes(val)) {
+                            setDraft((prev) => ({
+                              ...prev,
+                              services: [...(prev.services || []), val],
+                            }));
+                          }
+                          setServicesInputValue("");
+                        } else if (e.key === "Backspace" && servicesInputValue === "") {
+                          const current = draft.services || [];
+                          if (current.length > 0) {
+                            setDraft((prev) => ({
+                              ...prev,
+                              services: current.slice(0, -1),
+                            }));
+                          }
+                        }
                       }}
-                      className={`rounded-full px-2 py-0.5 text-xs font-medium border transition-all duration-150 ${
-                        isSelected
-                          ? "bg-green-50 text-green-700 border-green-200 ring-1 ring-green-600/10"
-                          : "bg-zinc-50 text-zinc-500 border-zinc-200 hover:bg-zinc-100 hover:text-zinc-800"
-                      }`}
-                    >
-                      {isSelected ? "✓ " : "+ "}
-                      <span className="capitalize">{service}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+                      className="flex-1 min-w-[80px] bg-transparent text-sm text-zinc-900 outline-none border-0 p-0 focus:outline-none focus:ring-0 focus:border-transparent"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400 mr-1">
+                      Suggestions:
+                    </span>
+                    {[
+                      "mowing",
+                      "trimming",
+                      "outside",
+                      "gutter cleaning",
+                      "weeding",
+                      "leaf removal",
+                      "pruning",
+                      "fertilizing",
+                      "planting",
+                    ].map((service) => {
+                      const isSelected = draft.services?.includes(service) ?? false;
+                      return (
+                        <button
+                          key={service}
+                          type="button"
+                          onClick={() => {
+                            const current = draft.services || [];
+                            setDraft((prev) => ({
+                              ...prev,
+                              services: isSelected
+                                ? current.filter((s) => s !== service)
+                                : [...current, service],
+                            }));
+                          }}
+                          className={`rounded-full px-2 py-0.5 text-xs font-medium border transition-all duration-150 ${
+                            isSelected
+                              ? "bg-green-50 text-green-700 border-green-200 ring-1 ring-green-600/10"
+                              : "bg-zinc-50 text-zinc-500 border-zinc-200 hover:bg-zinc-100 hover:text-zinc-800"
+                          }`}
+                        >
+                          {isSelected ? "✓ " : "+ "}
+                          <span className="capitalize">{service}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </>
+            )}
 
             <div>
               <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-zinc-500">

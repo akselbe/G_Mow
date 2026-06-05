@@ -22,6 +22,7 @@ export async function fetchAllProperties(): Promise<{
     const { data, error } = await supabase
       .from("properties")
       .select(SELECT_COLUMNS)
+      .eq("is_archived", false)
       .range(from, to);
 
     if (error) {
